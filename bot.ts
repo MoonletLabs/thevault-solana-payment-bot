@@ -25,12 +25,13 @@ import {
 } from "@saberhq/token-utils";
 import { depositSol, stakePoolInfo } from "@solana/spl-stake-pool";
 import { zPublicKey } from "@thevault/zod-solana";
+import { notifyFailure, notifySuccess } from "./notify";
 
 const FIRST_INVOICE_EPOCH = 780;
 
 dotenv.config();
 
-const { RPC_URL, VOTE_KEY, PRIVATE_KEY } = process.env;
+const { RPC_URL, VOTE_KEY, PRIVATE_KEY, DISCORD_WEBHOOK_URL } = process.env;
 
 if (!RPC_URL) {
   throw Error("No RPC URL set");
@@ -40,6 +41,11 @@ if (!VOTE_KEY) {
 }
 if (!PRIVATE_KEY) {
   throw Error("No PRIVATE_KEY set");
+}
+if (!DISCORD_WEBHOOK_URL) {
+  console.warn(
+    "DISCORD_WEBHOOK_URL not set — Discord notifications are disabled.",
+  );
 }
 
 /**
@@ -248,26 +254,45 @@ const setupPayInvoiceTx = async (signer: Keypair, invoices: Invoice[]) => {
 };
 
 const payInvoices = async () => {
-  const connection = new Connection(RPC_URL);
-  const payer = Keypair.fromSecretKey(Uint8Array.from(JSON.parse(PRIVATE_KEY)));
+  try {
+    const connection = new Connection(RPC_URL);
+    const payer = Keypair.fromSecretKey(
+      Uint8Array.from(JSON.parse(PRIVATE_KEY)),
+    );
 
-  // Get invoices that need to be paid
-  const invoices = await getInvoices(new PublicKey(VOTE_KEY));
-  console.log(invoices);
-  if (invoices.length === 0) {
-    console.log("No invoices to pay");
-    process.exit();
+    // Get invoices that need to be paid
+    const invoices = await getInvoices(new PublicKey(VOTE_KEY));
+    console.log(invoices);
+    if (invoices.length === 0) {
+      console.log("No invoices to pay");
+      process.exit();
+    }
+    const tx = await setupPayInvoiceTx(payer, invoices);
+    const hash = await sendTransactionWithRetry(
+      connection,
+      tx.instructions,
+      [...tx.signers, payer],
+      payer,
+      [],
+    );
+
+    console.log(hash);
+
+    await notifySuccess(DISCORD_WEBHOOK_URL, {
+      invoiceCount: invoices.length,
+      totalVsolLamports: invoices.reduce(
+        (acc, invoice) => acc + invoice.amountVsol,
+        0n,
+      ),
+      epochs: invoices.map((invoice) => invoice.epoch),
+      txHash: hash,
+    });
+  } catch (e: any) {
+    await notifyFailure(DISCORD_WEBHOOK_URL, {
+      error: String(e?.message ?? e),
+    });
+    throw e;
   }
-  const tx = await setupPayInvoiceTx(payer, invoices);
-  const hash = await sendTransactionWithRetry(
-    connection,
-    tx.instructions,
-    [...tx.signers, payer],
-    payer,
-    [],
-  );
-
-  console.log(hash);
 };
 
 payInvoices();
