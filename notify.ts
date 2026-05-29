@@ -84,7 +84,7 @@ export const notifySuccess = async (
   await post(webhookUrl, {
     embeds: [
       {
-        title: "🎉 Invoices Paid Successfully",
+        title: "🎉 [The Vault] Invoices Paid Successfully",
         description: `✅ Successfully paid ${data.invoiceCount} invoice(s) for validator \`${VALIDATOR_NAME}\``,
         color: COLORS.success,
         fields: [
@@ -116,7 +116,7 @@ export const notifyFailure = async (
   await post(webhookUrl, {
     embeds: [
       {
-        title: "🚨 Invoice Payment Failed",
+        title: "🚨 [The Vault] Invoice Payment Failed",
         description: `❌ Failed to pay invoices for validator \`${VALIDATOR_NAME}\``,
         color: COLORS.failure,
         fields: [{ name: "Error", value: "```\n" + safe + "\n```" }],
