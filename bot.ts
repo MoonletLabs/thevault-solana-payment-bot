@@ -333,6 +333,7 @@ const payInvoices = async () => {
     throw e;
   } finally {
     await checkDirectedRank();
+    process.exit();
   }
 };
 
