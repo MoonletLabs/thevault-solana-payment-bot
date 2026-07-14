@@ -12,6 +12,7 @@ const VALIDATOR_NAME = "Moonlet";
 const COLORS = {
   success: 0x57f287, // Discord green
   failure: 0xed4245, // Discord red
+  warning: 0xfaa61a, // Discord orange
 };
 
 const WEBHOOK_TIMEOUT_MS = 10_000;
@@ -27,6 +28,7 @@ const safeForCodeBlock = (text: string): string =>
 
 interface DiscordEmbed {
   title: string;
+  url?: string;
   description?: string;
   color: number;
   fields?: { name: string; value: string; inline?: boolean }[];
@@ -92,6 +94,63 @@ export const notifySuccess = async (
           { name: "Transaction", value: txDisplay },
           { name: "Epochs Paid", value: epochsDisplay },
         ],
+        timestamp: new Date().toISOString(),
+      },
+    ],
+  });
+};
+
+export type RankAlertNotification = {
+  threshold: number;
+} & (
+  | {
+      found: true;
+      rank: number;
+      totalLeaders: number;
+      directedSol: number;
+    }
+  | {
+      found: false;
+      totalLeaders: number;
+    }
+);
+
+export const notifyRankAlert = async (
+  webhookUrl: string | undefined,
+  data: RankAlertNotification,
+): Promise<void> => {
+  if (!webhookUrl) return;
+
+  const description = data.found
+    ? `⚠️ Validator \`${VALIDATOR_NAME}\` dropped below rank #${data.threshold} on the Directed Stake Leaders board`
+    : `⚠️ Validator \`${VALIDATOR_NAME}\` was not found on the Directed Stake Leaders board`;
+
+  const fields: { name: string; value: string; inline?: boolean }[] = [
+    {
+      name: "Rank",
+      value: data.found
+        ? `#${data.rank} of ${data.totalLeaders}`
+        : `not found (of ${data.totalLeaders} leaders)`,
+      inline: true,
+    },
+    { name: "Threshold", value: `#${data.threshold}`, inline: true },
+  ];
+  if (data.found) {
+    fields.push({
+      name: "Directed Stake",
+      value: `${data.directedSol.toFixed(2)} SOL`,
+      inline: true,
+    });
+  }
+
+  await post(webhookUrl, {
+    embeds: [
+      {
+        title: "⚠️ [The Vault] Directed Stake Rank Alert",
+        url: "https://thevault.finance/validators",
+        description,
+        color: COLORS.warning,
+        fields,
         timestamp: new Date().toISOString(),
       },
     ],
