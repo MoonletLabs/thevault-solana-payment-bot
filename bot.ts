@@ -5,6 +5,7 @@ import {
   LAMPORTS_PER_SOL,
   PublicKey,
   Signer,
+  SystemProgram,
   TransactionInstruction,
 } from "@solana/web3.js";
 import * as dotenv from "dotenv";
@@ -73,7 +74,7 @@ export const zValidatorInvoice = z.object({
   amountVSol: z.coerce.bigint(),
 });
 
-interface Invoice {
+export interface Invoice {
   address: PublicKey;
   invoicer: PublicKey;
   voteAccount: PublicKey;
@@ -95,7 +96,7 @@ interface Invoice {
  * [vsol_reserves 32 -> @48][... authority fields ...][vsol invoicer data ...]
  * [mint 32 -> @272]. Verified against the live vSOL and VLP invoicers.
  */
-interface InvoicerInfo {
+export interface InvoicerInfo {
   address: PublicKey;
   mint: PublicKey;
   reserves: PublicKey;
@@ -169,7 +170,7 @@ const VLP_MINT = new PublicKey(
   "EUWoTx5vQQrxaDFdeK2PLUVbnmRWjw4x6sBbmcxBaHjF",
 );
 
-const VSOL_TOKEN_OBJ = new Token({
+export const VSOL_TOKEN_OBJ = new Token({
   name: "Vault SOL",
   logoURI:
     "https://gateway.irys.xyz/DTBps6awrJWectiBhMubYke4TBnE9kkVqyCVP4MB4irB",
@@ -179,7 +180,7 @@ const VSOL_TOKEN_OBJ = new Token({
   chainId: ChainId.MainnetBeta,
 });
 
-const VLP_TOKEN_OBJ = new Token({
+export const VLP_TOKEN_OBJ = new Token({
   name: "Vault Unstake LP",
   address: VLP_MINT.toBase58(),
   decimals: 9,
@@ -226,12 +227,12 @@ const invoicerCandidates = (): PublicKey[] =>
 const TRUSTED_INVOICERS = new Set(invoicerCandidates().map((p) => p.toBase58()));
 const allowUntrusted = process.env.ALLOW_UNTRUSTED_INVOICERS === "1";
 
-const connection = new Connection(RPC_URL);
+export const connection = new Connection(RPC_URL);
 
 const makeInvoicerProgram = (provider: AnchorProvider) =>
   new Program(vaultInvoicerIDL as any, provider);
 
-const makeLiquidUnstakerProgram = (provider: AnchorProvider) =>
+export const makeLiquidUnstakerProgram = (provider: AnchorProvider) =>
   new Program(liquidUnstakerIDL as any, provider);
 
 /**
@@ -241,7 +242,7 @@ const makeLiquidUnstakerProgram = (provider: AnchorProvider) =>
  * invoice PDAs for the epochs window over `INVOICERS`.
  * Returns them oldest-first so no invoice ages out of reach unpaid.
  */
-const getInvoices = async (voteAccount: PublicKey): Promise<Invoice[]> => {
+export const getInvoices = async (voteAccount: PublicKey): Promise<Invoice[]> => {
   const epochInfo = await connection.getEpochInfo();
   const currentEpoch = epochInfo.epoch;
   const lookback = Number(LOOKBACK_EPOCHS ?? 20);
@@ -339,7 +340,7 @@ const resolveInvoicer = async (address: PublicKey): Promise<InvoicerInfo> => {
   return { address, mint, reserves };
 };
 
-const getInvoicerInfos = async (invoices: Invoice[]) => {
+export const getInvoicerInfos = async (invoices: Invoice[]) => {
   const cache = new Map<string, InvoicerInfo>();
   for (const invoice of invoices) {
     const key = invoice.invoicer.toBase58();
@@ -350,7 +351,7 @@ const getInvoicerInfos = async (invoices: Invoice[]) => {
   return cache;
 };
 
-const getTokenBalance = async (owner: PublicKey, mint: PublicKey) => {
+export const getTokenBalance = async (owner: PublicKey, mint: PublicKey) => {
   const accounts = await connection.getTokenAccountsByOwner(owner, { mint });
   return accounts.value.reduce(
     (acc, a) =>
@@ -359,7 +360,7 @@ const getTokenBalance = async (owner: PublicKey, mint: PublicKey) => {
   );
 };
 
-const swapSOLForVSOL = async (
+export const swapSOLForVSOL = async (
   provider: Provider,
   userPublicKey: PublicKey,
   amount: number,
@@ -390,7 +391,7 @@ const swapSOLForVSOL = async (
  * The liquid unstaker's SOL -> VLP route: `deposit_sol` mints VLP straight
  * into the payer's VLP ATA. Mirrors the dapp's buildDepositSolInstructions.
  */
-const buildDepositSolInstructions = async (
+export const buildDepositSolInstructions = async (
   program: Program,
   provider: Provider,
   user: PublicKey,
@@ -425,8 +426,13 @@ const buildDepositSolInstructions = async (
       userLpAccount: userLpAccount.address,
       inventorySummary,
       clock: new PublicKey("SysvarC1ock11111111111111111111111111111111"),
-      systemProgram: { pubkey: PublicKey.default, isSigner: false, isWritable: false },
-      tokenProgram: { pubkey: new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"), isSigner: false, isWritable: false },
+      // Anchor >=0.30 accepts only PublicKey|string per account (see
+      // InstructionNamespaceFactory.accountsArray -> translateAddress); the
+      // old `{pubkey, isSigner, isWritable}` meta objects throw client-side
+      // with 'Wrong input type for account "systemProgram"'. Mirrors the
+      // dapp's buildDepositSolInstructions.
+      systemProgram: SystemProgram.programId,
+      tokenProgram: new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"),
     })
     .instruction();
 
@@ -437,7 +443,7 @@ const buildDepositSolInstructions = async (
   };
 };
 
-const getVSOLPrice = async () => {
+export const getVSOLPrice = async () => {
   const stakePool = await stakePoolInfo(
     connection,
     new PublicKey(STAKE_POOL_ADDRESS),
@@ -454,7 +460,7 @@ const getVSOLPrice = async () => {
  * — the funded SOL amount adds a margin on top of it, which only ever buys
  * extra VLP balance usable by later invoices.
  */
-const getVLPPriceSol = async () => {
+export const getVLPPriceSol = async () => {
   const provider = new AnchorProvider(
     connection,
     { publicKey: PublicKey.default } as any,
@@ -740,7 +746,7 @@ const payInvoices = async () => {
   );
 };
 
-const makeInvoicerProgramReadOnly = () =>
+export const makeInvoicerProgramReadOnly = () =>
   makeInvoicerProgram(
     new AnchorProvider(
       connection,
@@ -749,7 +755,7 @@ const makeInvoicerProgramReadOnly = () =>
     ),
   );
 
-const buildPayChunks = async (
+export const buildPayChunks = async (
   program: Program,
   invoices: Invoice[],
   invoicerInfos: Map<string, InvoicerInfo>,
@@ -784,4 +790,7 @@ const buildPayChunks = async (
   return chunks;
 };
 
-payInvoices();
+// Importable without auto-running (selftest.ts reuses the builders above).
+if (require.main === module) {
+  payInvoices();
+}

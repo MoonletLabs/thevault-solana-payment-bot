@@ -48,8 +48,12 @@ export const createVersionedTransaction = async (
   addCUs: boolean,
   atas: AddressLookupTableAccount[],
 ) => {
-  const latestBlockhash = await connection.getLatestBlockhash("finalized");
-  const CUs = await getCUsForTx(connection, latestBlockhash, txs, payerKey);
+  // CU estimation gets its own throwaway blockhash (simulation ignores
+  // expiry) and may poll for a while — the blockhash that SHIPS with the tx
+  // is fetched only after it, right before compiling (see below), so a slow
+  // estimation can no longer stale the blockhash the tx is sent with.
+  const estimateBlockhash = await connection.getLatestBlockhash("finalized");
+  const CUs = await getCUsForTx(connection, estimateBlockhash, txs, payerKey);
   console.log("CUs:", CUs);
 
   if (addCUs) {
@@ -67,6 +71,9 @@ export const createVersionedTransaction = async (
     );
   }
 
+  // Fresh blockhash per build (= per send attempt): the instructions may be
+  // pre-built, but the VersionedTransaction is always re-created.
+  const latestBlockhash = await connection.getLatestBlockhash("finalized");
   const messageV0 = new TransactionMessage({
     payerKey,
     recentBlockhash: latestBlockhash.blockhash,
@@ -76,6 +83,12 @@ export const createVersionedTransaction = async (
   return { transaction, latestBlockhash };
 };
 
+// 100 retries of a tx that keeps expiring (each round: CU estimation, 120s
+// send window, blockhash lifetime) meant hours of stale-signature polling.
+// With a fresh blockhash per attempt, a handful of retries covers
+// propagation races; anything beyond that is a real error.
+const MAX_RETRIES = 10;
+
 export const sendTransactionWithRetry = async (
   connection: Connection,
   txs: TransactionInstruction[],
@@ -84,6 +97,8 @@ export const sendTransactionWithRetry = async (
   atas: AddressLookupTableAccount[],
   retryNum = 0,
 ): Promise<string | undefined> => {
+  // Every attempt builds from scratch: fresh blockhash + new
+  // VersionedTransaction around the pre-built instructions.
   const vt = await createVersionedTransaction(
     connection,
     txs,
@@ -92,17 +107,32 @@ export const sendTransactionWithRetry = async (
     atas,
   );
 
-  // Filter only the required signers
+  // Filter only the required signers. The fee payer ALWAYS signs the tx and
+  // is not necessarily listed in allSigners (the funding call only passes
+  // instruction signers, e.g. transient stake accounts) — an unsigned payer
+  // kept web3.js's zero-filled placeholder signature, which serializes fine,
+  // gets accepted by RPC, and whose base58 ("111111111111111111111111111111
+  // 11", i.e. all-zero bytes) is then polled as the 'signature' until the
+  // blockhash expires — the "Signature 1111…1 has expired" retry spiral.
   const signerPubkeys = vt.transaction.message.staticAccountKeys
     .slice(0, vt.transaction.message.header.numRequiredSignatures)
     .map((p) => p.toString());
 
-  const signers = allSigners.filter(
-    (s) =>
-      s.publicKey.toString() === payerKey.publicKey.toString() ||
-      signerPubkeys.includes(s.publicKey.toString()),
+  const signers = [payerKey, ...allSigners].filter(
+    (s, i, self) =>
+      signerPubkeys.includes(s.publicKey.toString()) &&
+      self.findIndex((o) => o.publicKey.equals(s.publicKey)) === i,
   );
   vt.transaction.sign(signers);
+
+  // Never send (and never confirmTransaction on) a placeholder signature.
+  const missing = vt.transaction.message.staticAccountKeys
+    .slice(0, vt.transaction.message.header.numRequiredSignatures)
+    .filter((_, i) => !(vt.transaction.signatures[i] as Uint8Array).some((b) => b !== 0))
+    .map((p) => p.toBase58());
+  if (missing.length) {
+    throw Error(`Refusing to send: no signer for required signer(s) ${missing.join(", ")}`);
+  }
 
   console.log(Buffer.from(vt.transaction.serialize()).toString("base64"));
 
@@ -134,7 +164,7 @@ export const sendTransactionWithRetry = async (
     ];
     if (
       conditions.some(
-        (condition) => e.message.includes(condition) && retryNum < 100,
+        (condition) => e.message.includes(condition) && retryNum < MAX_RETRIES,
       )
     ) {
       console.log("Retrying...", retryNum, "-", e.message);
