@@ -60,7 +60,14 @@ SOL inside the run:
 
 A token whose top-up fails (price oracle down, pool deposit caps, no SOL) is
 skipped for that run; invoices already covered by your balances still get
-paid. Invoices are paid oldest-first (max `MAX_INVOICES_PER_RUN`, default 10,
+paid. Funding transactions are confirmed (polled to `confirmed`/`finalized`)
+**before** balances are re-read and before anything is paid — balances are
+read at `confirmed`, never off a pre-funding read. A funding tx that stays
+unsettled is re-broadcast up to twice (never while the confirmed balance
+already covers what it buys), and if it still won't settle, that token's
+invoices are deferred to the next run; if the tx lands after the run, the next
+run sees the bought balance and pays without re-funding.
+Invoices are paid oldest-first (max `MAX_INVOICES_PER_RUN`, default 10,
 within `LOOKBACK_EPOCHS`, default 20) so old invoices never age out unpaid.
 
 ## Diagnostics
@@ -83,6 +90,8 @@ machine, and useful in Actions logs when debugging “why didn't it pay”.
 | `LOOKBACK_EPOCHS` | `20` | ignore unpaid invoices older than this. |
 | `INVOICERS` | built-in list of the four known invoicers | comma-separated **trusted** invoicer addresses: invoices from any other invoicer are never paid, and this set is also the PDA fallback source for scan-less RPCs. Update it when The Vault adds an invoicer — see Security above. |
 | `ALLOW_UNTRUSTED_INVOICERS` | unset | `1`: pay invoices from untrusted invoicers (logs WARNING). Only after verifying a new/rotated invoicer out-of-band. |
+| `CONFIRM_TIMEOUT_MS` | `90000` | wall-clock bound per broadcast for the confirm poll; on expiry the tx is rebuilt/re-sent (max 2) or deferred. |
+| `VERBOSE` | unset | `1`: also print the raw base64 of every built transaction (default output is quiet: `sent <sig>` + outcome only). |
 | `FORCE_PDA_FALLBACK` | unset | `1`: skip the program scan and use the PDA/`INVOICERS` path (to test it against your RPC). |
 
 ## Testing against a mainnet fork (Surfpool)
@@ -109,7 +118,7 @@ Steps (each maps to one exit code — `0` all green, `2` setup, `3`–`9` per st
 | B | the validator's real unpaid invoices (incl. the VLP one) are visible & unpaid |
 | E1 | `LIST_ONLY=1` (keyless) serializes/sends nothing (fork tx count unchanged) |
 | E2 | an **unfunded** wallet degrades: invoices skipped, nothing sent, no retry loop |
-| C | full run: both funding swaps succeed on-chain and every due invoice is paid |
+| C | full run: the funding the due tokens require lands confirmed and every due invoice is paid |
 | D | invoices flip to `outstanding=0`, wallet deltas sane, immediate re-run pays nothing |
 | F | keyless `selftest.ts` against the public RPC (skip with `SKIP_SELFTEST=1`) |
 

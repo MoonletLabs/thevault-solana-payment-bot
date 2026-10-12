@@ -7,6 +7,7 @@
  *   npx tsx e2e-support.ts dump        [pubkey]             invoice JSON lines (+ token/SOL balances if pubkey given)
  *   npx tsx e2e-support.ts unpaid      <outfile>            due invoices oldest-first (cap MAX_INVOICES_PER_RUN), exit 1 if none
  *   npx tsx e2e-support.ts expect-paid <outfile>            exit 1 unless every listed invoice outstanding == 0
+ *   npx tsx e2e-support.ts due-mints   <outfile>            settlement mints of the due invoicers (subset of vSOL/VLP)
  *   npx tsx e2e-support.ts txcount                          print getTransactionCount
  *
  * env: RPC_URL (fork) VOTE_KEY INVOICERS LOOKBACK_EPOCHS MAX_INVOICES_PER_RUN
@@ -196,6 +197,32 @@ const main = async () => {
         if (!ok) bad++;
       }
       process.exit(bad ? 1 : 0);
+    }
+    case "due-mints": {
+      // Mint each due invoicer settles in (bot's own layout rule: 304 B
+      // account carries its mint at @272, zero-filled = vSOL, 272 B = vSOL) —
+      // so the harness can assert funding per token actually due, without
+      // hard-coding which tokens the current epoch happens to bill.
+      const mints = new Set<string>();
+      for (const line of fs
+        .readFileSync(args[0], "utf8")
+        .split("\n")
+        .filter(Boolean)) {
+        const invoicer = line.split(" ")[0];
+        const info = await conn.getAccountInfo(new PublicKey(invoicer));
+        if (!info) continue;
+        let mint: string;
+        if (info.data.length === 304) {
+          const m = info.data.subarray(272, 304);
+          mint = m.equals(Buffer.alloc(32))
+            ? MINTS[0][0]
+            : new PublicKey(m).toBase58();
+        } else if (info.data.length === 272) mint = MINTS[0][0];
+        else continue;
+        if (MINTS.some(([m]) => m === mint)) mints.add(mint);
+      }
+      for (const m of mints) console.log(m);
+      break;
     }
     case "txcount": {
       console.log(await conn.getTransactionCount("confirmed"));

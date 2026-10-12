@@ -1,5 +1,6 @@
 import {
   AccountInfo,
+  Commitment,
   Connection,
   Keypair,
   LAMPORTS_PER_SOL,
@@ -9,7 +10,10 @@ import {
   TransactionInstruction,
 } from "@solana/web3.js";
 import * as dotenv from "dotenv";
-import { sendTransactionWithRetry } from "./transaction";
+import {
+  sendTransactionWithRetry,
+  TransactionPendingError,
+} from "./transaction";
 import { z } from "zod";
 import vaultInvoicerIDL from "./IDL/vaultInvoicer.json";
 import liquidUnstakerIDL from "./IDL/liquidUnstaker.json";
@@ -351,8 +355,22 @@ export const getInvoicerInfos = async (invoices: Invoice[]) => {
   return cache;
 };
 
-export const getTokenBalance = async (owner: PublicKey, mint: PublicKey) => {
-  const accounts = await connection.getTokenAccountsByOwner(owner, { mint });
+/**
+ * Token balance of an owner, by default at 'confirmed'. The RPC default
+ * ('finalized') lags a just-confirmed transfer by tens of seconds — reading
+ * post-funding balances that way made a landed purchase look like zero and the
+ * run skipped paying invoices it could have paid.
+ */
+export const getTokenBalance = async (
+  owner: PublicKey,
+  mint: PublicKey,
+  commitment: Commitment = "confirmed",
+) => {
+  const accounts = await connection.getTokenAccountsByOwner(
+    owner,
+    { mint },
+    commitment,
+  );
   return accounts.value.reduce(
     (acc, a) =>
       acc + Number(a.account.data.readBigUInt64LE(64)) / 10 ** 9,
@@ -633,14 +651,19 @@ const payInvoices = async () => {
     process.exit(0);
   }
 
+  // Top-up plan (mint -> SOL spent) + a funding tx that was broadcast but
+  // never confirmed, hoisted so the pay decision below can consult both.
+  const fundingSol = new Map<string, number>();
+  let fundingUnsettled: { sig: string; reason: string } | null = null;
+
   if (payer && provider) {
     // Top up payment tokens that are short, as one funding transaction, then
-    // re-read balances. A token we cannot fund (price oracle down, deposit
-    // caps, no SOL) only costs that token its invoices this run — the other
-    // token's invoices still get paid from its balance.
+    // re-read balances AT 'confirmed' once the tx is confirmed (never make the
+    // pay decision off a pre-funding read). A token we cannot fund (price
+    // oracle down, deposit caps, no SOL) only costs that token its invoices
+    // this run — the other token's invoices still get paid from its balance.
     const fundingIxs: TransactionInstruction[] = [];
     const fundingSigners: Signer[] = [];
-    const fundingSol = new Map<string, number>();
     for (const { mint, amount } of dueByMint.values()) {
       const dueTokens = Number(amount) / 10 ** 9;
       const balance = balances.get(mint.toBase58()) ?? 0;
@@ -685,13 +708,45 @@ const payInvoices = async () => {
         console.log(
           `Funding: ${[...fundingSol].map(([m, s]) => `${s.toFixed(4)} SOL -> ${m}`).join(", ")}`,
         );
-        await sendTransactionWithRetry(
-          connection,
-          fundingIxs,
-          [...fundingSigners],
-          payer,
-          [],
-        );
+        try {
+          await sendTransactionWithRetry(
+            connection,
+            fundingIxs,
+            [...fundingSigners],
+            payer,
+            [],
+            0,
+            {
+              // Re-broadcast an UNSETTLED funding tx only while some bought
+              // token is still confirmed-short — if the (confirmed) balance
+              // already covers the due amount, the tx landed after our poll
+              // gave up, and re-sending would buy the tokens a second time.
+              preRebroadcast: async () => {
+                let stillShort = false;
+                for (const mintB58 of fundingSol.keys()) {
+                  const g = dueByMint.get(mintB58)!;
+                  const bal = await getTokenBalance(payer.publicKey, g.mint);
+                  if (bal < Number(g.amount) / 10 ** 9) stillShort = true;
+                  else balances.set(mintB58, bal);
+                }
+                return stillShort;
+              },
+            },
+          );
+        } catch (e: any) {
+          fundingUnsettled = {
+            sig:
+              e instanceof TransactionPendingError && e.signature
+                ? e.signature
+                : "no-settled-tx",
+            reason: e?.message ?? String(e),
+          };
+          console.log(
+            `Funding tx not confirmed (${fundingUnsettled.reason}) — re-checking balances at 'confirmed' before deciding.`,
+          );
+        }
+        // Always re-read at 'confirmed': covers a landed funding tx the poll
+        // timed out on, and never pays off the pre-funding (stale) read.
         await readBalances();
       }
     }
@@ -716,6 +771,24 @@ const payInvoices = async () => {
         .join(", ")}`,
     );
   }
+  // A funding tx that never settled: name the mint + signature so the skip is
+  // traceable. If it lands after this run, the next run sees the bought balance
+  // and pays without re-funding; if it truly died, the next run funds again.
+  if (fundingUnsettled) {
+    for (const mintB58 of fundingSol.keys()) {
+      if (
+        payableNow.some(
+          (i) =>
+            invoicerInfos.get(i.invoicer.toBase58())!.mint.toBase58() ===
+            mintB58,
+        )
+      )
+        continue;
+      console.log(
+        `funding ${mintB58}: tx ${fundingUnsettled.sig} still pending — invoices deferred to next run`,
+      );
+    }
+  }
   if (!payableNow.length) {
     console.log("Nothing payable this run.");
     process.exit(0);
@@ -730,14 +803,31 @@ const payInvoices = async () => {
     invoicerInfos,
     payer!.publicKey,
   );
-  for (const [i, chunk] of chunks.entries()) {
-    console.log(`Paying chunk ${i + 1}/${chunks.length}...`);
+  for (const [ci, chunk] of chunks.entries()) {
+    console.log(`Paying chunk ${ci + 1}/${chunks.length}...`);
+    const chunkInvoices = payableNow.slice(ci * 8, ci * 8 + 8);
     const hash = await sendTransactionWithRetry(
       connection,
       chunk,
       [payer!],
       payer!,
       [],
+      0,
+      {
+        // Re-send an UNSETTLED pay tx only while every invoice it covers is
+        // still outstanding at 'confirmed' — a broadcast that landed after the
+        // poll gave up must not be paid twice.
+        preRebroadcast: async () => {
+          for (const inv of chunkInvoices) {
+            const info = await connection.getAccountInfo(
+              inv.address,
+              "confirmed",
+            );
+            if (!info || info.data.readBigUInt64LE(88) > 0n) return true;
+          }
+          return false;
+        },
+      },
     );
     console.log(hash);
   }

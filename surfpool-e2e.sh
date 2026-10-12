@@ -9,11 +9,13 @@
 #
 # What it proves (one exit code per step):
 #   A  fresh throwaway payer funded on the fork via requestAirdrop
-#   B  the validator's real unpaid invoices (incl. the VLP one) visible & unpaid
+#   B  the validator's real unpaid invoices are visible & unpaid (incl. VLP)
 #   E1 LIST_ONLY=1 sends nothing (fork transaction count unchanged)
 #   E2 unfunded wallet degrades cleanly: no send, no zero-sig retry loop
-#   C  full bot run: SOL->vSOL (Marinade) + SOL->VLP (liquid unstaker deposit_sol)
-#      funding succeed on the fork and every due invoice gets paid. The bot
+#   C  full bot run: the funding the due tokens require (SOL->vSOL Marinade
+#      and/or SOL->VLP liquid-staker deposit_sol) lands CONFIRMED on the fork
+#      (top-up tx is polled to confirmed, balances re-read at 'confirmed',
+#      only then the pay decision) and every due invoice gets paid. The bot
 #      pays with owner-signed pay_invoice from its own ATAs — no delegation
 #      setup is needed (see README section).
 #   D  post-state: invoices flip to outstanding=0, wallet balances sane, and an
@@ -168,7 +170,7 @@ LAM=$(HX dump "$UNFUNDED_PUBKEY" | grep 'BALANCE SOL' | awk '{print $3}')
 echo "PASS E2: funding skipped, nothing sent, no retry loop"
 
 # ---------- C: full run -------------------------------------------------------------
-STEP "C: full bot run (SOL->vSOL Marinade + SOL->VLP deposit_sol, then pay_invoice)"
+STEP "C: full bot run (fund the due tokens via Marinade/liquid-unstaker, then pay_invoice)"
 PRIVATE_KEY=$(cat "$PAYER") npx tsx bot.ts >"$RUN_LOG" 2>&1 && C_EXIT=0 || C_EXIT=$?
 grep -E 'Funding|Paying chunk|^Paid |Cannot fund|skipping top-ups|Still short|SECURITY|Retrying|TX failed' "$RUN_LOG" || true
 [ $C_EXIT -eq 0 ] || { EXPORT_CODE=5; fail "C: bot exited $C_EXIT — see $RUN_LOG"; }
@@ -176,8 +178,10 @@ grep -q '^Paid ' "$RUN_LOG" || { EXPORT_CODE=5; fail "C: no 'Paid' line — see 
 echo "$RUN_LOG" | grep -q 'Retrying' && { EXPORT_CODE=5; fail "C: needed send retries — investigate"; }
 if [ $PAYER_WAS_NEW -eq 1 ]; then
   grep -q '^Funding:' "$RUN_LOG" || { EXPORT_CODE=5; fail "C: fresh payer did not fund — funding path broken"; }
-  grep -q 'Funding:.*vSoLxydx6akxyMD9XEcPvGYNGq6Nn66oqVb3UkGkei7' "$RUN_LOG" || { EXPORT_CODE=5; fail "C: no vSOL funding planned"; }
-  grep -q 'Funding:.*EUWoTx5vQQrxaDFdeK2PLUVbnmRWjw4x6sBbmcxBaHjF' "$RUN_LOG" || { EXPORT_CODE=5; fail "C: no VLP funding planned"; }
+  # every settlement token the current invoices are due in must have been bought
+  for MINT in $(HX due-mints "$DUE"); do
+    grep -q "Funding:.*$MINT" "$RUN_LOG" || { EXPORT_CODE=5; fail "C: no funding planned for due mint $MINT"; }
+  done
 fi
 echo "PASS C (log: $RUN_LOG)"
 

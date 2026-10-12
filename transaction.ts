@@ -83,11 +83,86 @@ export const createVersionedTransaction = async (
   return { transaction, latestBlockhash };
 };
 
-// 100 retries of a tx that keeps expiring (each round: CU estimation, 120s
-// send window, blockhash lifetime) meant hours of stale-signature polling.
-// With a fresh blockhash per attempt, a handful of retries covers
-// propagation races; anything beyond that is a real error.
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Result of bounded confirmation polling. 'landed' is the only outcome after
+ * which reading on-chain state at 'confirmed' is guaranteed to reflect the tx.
+ */
+export type ConfirmationOutcome =
+  | { kind: "landed" }
+  | { kind: "failed"; err: unknown }
+  /** block height passed lastValidBlockHeight with no status — can no longer land */
+  | { kind: "expired" }
+  /** wall-clock timeout, status still null/processed */
+  | { kind: "pending" };
+
+/**
+ * Poll getSignatureStatuses until the signature is confirmed/finalized, dies
+ * (expired blockhash), errors on-chain, or wall-clock runs out. Deliberately
+ * NOT Connection.confirmTransaction: at commitment 'processed' it resolves the
+ * moment the RPC has seen the tx processed, and the then-immediate balance
+ * re-reads (RPC default commitment 'finalized') still showed the PRE-tx state
+ * — the field bug where a landed funding tx was read as "Still short".
+ */
+export const waitForConfirmation = async (
+  connection: Connection,
+  signature: string,
+  lastValidBlockHeight: number,
+  timeoutMs: number,
+): Promise<ConfirmationOutcome> => {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    const status = (
+      await connection.getSignatureStatuses([signature], {
+        searchTransactionHistory: true,
+      })
+    ).value[0];
+    if (status?.err) return { kind: "failed", err: status.err };
+    if (
+      status &&
+      (status.confirmationStatus === "confirmed" ||
+        status.confirmationStatus === "finalized")
+    ) {
+      return { kind: "landed" };
+    }
+    if (
+      !status &&
+      (await connection.getBlockHeight("confirmed")) > lastValidBlockHeight
+    ) {
+      return { kind: "expired" };
+    }
+    await sleep(Math.min(2000, deadline - Date.now()));
+  } while (Date.now() < deadline);
+  return { kind: "pending" };
+};
+
+/** Broadcast (multiple times) but never settled on-chain. */
+export class TransactionPendingError extends Error {
+  constructor(
+    public signature: string | undefined,
+    message: string,
+  ) {
+    super(message);
+    this.name = "TransactionPendingError";
+  }
+}
+
+export interface SendOptions {
+  /**
+   * Called before re-broadcasting an UNSETTLED tx: return false to skip the
+   * re-send — e.g. for a funding tx whose effect is already covered by the
+   * (re-read, confirmed) balance, where re-sending would buy the tokens twice.
+   */
+  preRebroadcast?: (signature: string) => Promise<boolean>;
+}
+
+// A send that keeps erroring (each round refreshes the blockhash) is retried a
+// handful of times; anything beyond is a real error.
 const MAX_RETRIES = 10;
+
+// An unsettled broadcast (pending/expired) gets this many fresh rebuilds.
+const MAX_REBROADCASTS = 2;
 
 export const sendTransactionWithRetry = async (
   connection: Connection,
@@ -96,6 +171,7 @@ export const sendTransactionWithRetry = async (
   payerKey: Signer,
   atas: AddressLookupTableAccount[],
   retryNum = 0,
+  options: SendOptions = {},
 ): Promise<string | undefined> => {
   // Every attempt builds from scratch: fresh blockhash + new
   // VersionedTransaction around the pre-built instructions.
@@ -134,27 +210,23 @@ export const sendTransactionWithRetry = async (
     throw Error(`Refusing to send: no signer for required signer(s) ${missing.join(", ")}`);
   }
 
-  console.log(Buffer.from(vt.transaction.serialize()).toString("base64"));
+  if (process.env.VERBOSE === "1") {
+    console.log(Buffer.from(vt.transaction.serialize()).toString("base64"));
+  }
 
+  let hash: string;
+  let outcome: ConfirmationOutcome;
   try {
-    const hash = await Promise.race([
-      (async () => {
-        const hash = await connection.sendTransaction(vt.transaction);
-        await connection.confirmTransaction(
-          {
-            signature: hash,
-            ...vt.latestBlockhash,
-          },
-          "processed",
-        );
-        return hash;
-      })(),
-      (async () => {
-        await new Promise((resolve) => setTimeout(resolve, 120000));
-        throw Error("Timeout");
-      })(),
-    ]);
-    return hash;
+    hash = await connection.sendTransaction(vt.transaction);
+    console.log(`sent ${hash}${retryNum ? ` (broadcast ${retryNum + 1})` : ""}`);
+    const timeoutMs =
+      Number(process.env.CONFIRM_TIMEOUT_MS ?? 90_000) || 90_000;
+    outcome = await waitForConfirmation(
+      connection,
+      hash,
+      vt.latestBlockhash.lastValidBlockHeight,
+      timeoutMs,
+    );
   } catch (e: any) {
     console.log(e.message);
     const conditions = [
@@ -168,7 +240,7 @@ export const sendTransactionWithRetry = async (
       )
     ) {
       console.log("Retrying...", retryNum, "-", e.message);
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      await sleep(1000);
       return sendTransactionWithRetry(
         connection,
         txs,
@@ -176,6 +248,7 @@ export const sendTransactionWithRetry = async (
         payerKey,
         atas,
         retryNum + 1,
+        options,
       );
     } else {
       console.log("TX failed");
@@ -183,4 +256,44 @@ export const sendTransactionWithRetry = async (
       throw e;
     }
   }
+
+  if (outcome.kind === "landed") return hash;
+
+  if (outcome.kind === "failed") {
+    console.log("TX failed", JSON.stringify(outcome.err));
+    console.log(Buffer.from(vt.transaction.serialize()).toString("base64"));
+    throw Error(
+      `Transaction ${hash} failed on-chain: ${JSON.stringify(outcome.err)}`,
+    );
+  }
+
+  // pending | expired: only worth re-broadcasting while the effect is missing.
+  if (retryNum < MAX_REBROADCASTS) {
+    const mayResend =
+      options.preRebroadcast === undefined
+        ? true
+        : await options.preRebroadcast(hash);
+    if (mayResend) {
+      console.log(
+        `tx ${hash} unsettled (${outcome.kind}) — rebuilding with a fresh blockhash and re-sending (${retryNum + 1}/${MAX_REBROADCASTS})`,
+      );
+      return sendTransactionWithRetry(
+        connection,
+        txs,
+        allSigners,
+        payerKey,
+        atas,
+        retryNum + 1,
+        options,
+      );
+    }
+    console.log(
+      `tx ${hash} unsettled (${outcome.kind}) but on-chain state already covers its effect — not re-sending`,
+    );
+    return hash;
+  }
+  throw new TransactionPendingError(
+    hash,
+    `Transaction ${hash} still unsettled (${outcome.kind}) after ${MAX_REBROADCASTS + 1} broadcast(s)`,
+  );
 };
