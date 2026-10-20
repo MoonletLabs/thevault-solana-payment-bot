@@ -96,8 +96,7 @@ machine, and useful in Actions logs when debugging “why didn't it pay”.
 
 ## Testing against a mainnet fork (Surfpool)
 
-`./surfpool-e2e.sh` proves the whole flow — invoice discovery, SOL→vSOL
-(Marinade) and SOL→VLP (liquid unstaker) funding, payment, idempotency —
+`./surfpool-e2e.sh` proves the whole flow — invoice discovery, SOL→vSOL and SOL→VLP (liquid unstaker) funding, payment, idempotency —
 against a **local mainnet fork** served by [Surfpool](https://github.com/surfpool/surfpool)
 (tested with surfpool 1.5.0). It never talks to real mainnet with your wallet:
 every transaction goes to the fork; accounts are materialized on demand from
