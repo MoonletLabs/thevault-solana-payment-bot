@@ -1,7 +1,7 @@
 /**
  * Discord webhook notifications for the SaaS payment bot.
  *
- * - Uses native `fetch` (Node >= 18 has it built in; the workflow uses Node 22).
+ * - Uses native `fetch` (Node >= 18 has it built in).
  * - All errors are swallowed and logged as warnings; a webhook failure must
  *   never crash the bot or affect payment behavior.
  * - If the webhook URL is not provided, all helpers become no-ops.
@@ -62,8 +62,8 @@ const post = async (
 
 export interface SuccessNotification {
   invoiceCount: number;
-  /** Total amount paid, in vSOL lamports (9 decimals). */
-  totalVsolLamports: bigint;
+  /** Totals per settlement token, in base units (both supported mints use 9 decimals). */
+  amounts: { symbol: string; lamports: bigint }[];
   epochs: number[];
   txHash: string | undefined;
 }
@@ -74,7 +74,9 @@ export const notifySuccess = async (
 ): Promise<void> => {
   if (!webhookUrl) return;
 
-  const totalVsol = (Number(data.totalVsolLamports) / 1e9).toFixed(9);
+  const totals = data.amounts.map(({ symbol, lamports }) =>
+    `${lamports / 1_000_000_000n}.${(lamports % 1_000_000_000n).toString().padStart(9, "0")} ${symbol}`,
+  ).join("\n");
   const txDisplay = data.txHash
     ? `[${shortSig(data.txHash)}](${SOLSCAN_TX(data.txHash)})`
     : "unknown";
@@ -90,7 +92,7 @@ export const notifySuccess = async (
         description: `✅ Successfully paid ${data.invoiceCount} invoice(s) for validator \`${VALIDATOR_NAME}\``,
         color: COLORS.success,
         fields: [
-          { name: "Total Amount", value: `${totalVsol} vSOL` },
+          { name: "Total Amount", value: totals },
           { name: "Transaction", value: txDisplay },
           { name: "Epochs Paid", value: epochsDisplay },
         ],
@@ -159,6 +161,8 @@ export const notifyRankAlert = async (
 
 export interface FailureNotification {
   error: string;
+  pending?: boolean;
+  txHash?: string;
 }
 
 export const notifyFailure = async (
@@ -175,10 +179,17 @@ export const notifyFailure = async (
   await post(webhookUrl, {
     embeds: [
       {
-        title: "🚨 [The Vault] Invoice Payment Failed",
-        description: `❌ Failed to pay invoices for validator \`${VALIDATOR_NAME}\``,
-        color: COLORS.failure,
-        fields: [{ name: "Error", value: "```\n" + safe + "\n```" }],
+        title: data.pending
+          ? "⚠️ [The Vault] Invoice Payment Unconfirmed"
+          : "🚨 [The Vault] Invoice Payment Failed",
+        description: data.pending
+          ? `⚠️ Payment outcome is uncertain for validator \`${VALIDATOR_NAME}\`; verify the transaction before retrying.`
+          : `❌ Failed to pay invoices for validator \`${VALIDATOR_NAME}\`. Any earlier confirmed chunks remain paid.`,
+        color: data.pending ? COLORS.warning : COLORS.failure,
+        fields: [
+          { name: data.pending ? "Details" : "Error", value: "```\n" + safe + "\n```" },
+          ...(data.txHash ? [{ name: "Transaction", value: `[${shortSig(data.txHash)}](${SOLSCAN_TX(data.txHash)})` }] : []),
+        ],
         timestamp: new Date().toISOString(),
       },
     ],
