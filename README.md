@@ -53,7 +53,7 @@ an invoicer rotation you already verified.
 If your wallet lacks the token an invoice settles in, the bot buys it with
 SOL inside the run:
 
-- vSOL: deposited into the Marinade stake pool (`@solana/spl-stake-pool`).
+- vSOL: deposited into the Vault stake pool (`@solana/spl-stake-pool`).
 - VLP: minted by The Vault's liquid unstaker (`deposit_sol`), the same route
   the dapp's “Pay” button uses. Estimated from the pool's SOL/VLP rate with a
   30% margin — the surplus just stays in your VLP balance for later runs.
