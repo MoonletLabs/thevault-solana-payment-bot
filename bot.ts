@@ -447,11 +447,13 @@ export const buildDepositSolInstructions = async (
 };
 
 /**
- * Price of one VLP in SOL, from the unstake pool account:
- * (SOL in the vault + deactivating stake lamports) / circulating VLP.
- * Deliberately a floor — the pool also holds LST inventory not counted here
- * — the funded SOL amount adds a margin on top of it, which only ever buys
- * extra VLP balance usable by later invoices.
+ * Price of one VLP in SOL, from the unstake pool:
+ * (SOL in the vault + deactivating stake lamports + LST inventory value)
+ * / circulating VLP. The inventory value is the snapshot kept in the pool's
+ * `inventory_summary` account; it is a large share of the pool, so leaving
+ * it out underprices VLP badly and the top-up never covers the deficit. The
+ * funded SOL amount adds a margin on top for drift since the snapshot, which
+ * only ever buys extra VLP balance usable by later invoices.
  */
 export const getVLPPriceSol = async () => {
   const provider = new AnchorProvider(
@@ -459,15 +461,22 @@ export const getVLPPriceSol = async () => {
     { publicKey: PublicKey.default } as any,
     { commitment: "confirmed" },
   );
-  const pool = await makeLiquidUnstakerProgram(provider).account.pool.fetch(
-    LIQUID_UNSTAKER_POOL,
+  const program = makeLiquidUnstakerProgram(provider);
+  const [inventorySummary] = PublicKey.findProgramAddressSync(
+    [Buffer.from("inventory_summary"), LIQUID_UNSTAKER_POOL.toBuffer()],
+    program.programId,
   );
+  const [pool, inventory] = await Promise.all([
+    program.account.pool.fetch(LIQUID_UNSTAKER_POOL),
+    program.account.inventorySummary.fetch(inventorySummary),
+  ]);
   const totalLpTokens = new BigNumber(pool.totalLpTokens.toString());
   if (totalLpTokens.isZero()) {
     return null;
   }
   return new BigNumber(pool.solVaultLamports.toString())
     .plus(pool.totalDeactivatingStake.toString())
+    .plus(inventory.totalValueSnapshot.toString())
     .div(totalLpTokens)
     .toNumber();
 };
@@ -555,7 +564,7 @@ const payInvoices = async () => {
   }
 
   // Plan view: what is due in VLP, what the wallet holds, and roughly how
-  // much SOL a top-up needs (VLP: floor price + 30% margin). Listing only —
+  // much SOL a top-up needs (VLP: pool price + 30% margin). Listing only —
   // funding instructions are built during a real run so LIST never signs.
   const plan = [...dueByMint.values()].map(({ mint, amount }) => {
     const dueTokens = Number(amount) / 10 ** 9;
