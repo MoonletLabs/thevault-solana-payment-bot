@@ -12,20 +12,58 @@ import {
   type TransactionInstruction,
 } from "@solana/web3.js";
 import { getATAAddressSync } from "@saberhq/token-utils";
+import { BN, Program } from "@coral-xyz/anchor";
 import type { DirectedRankResult } from "../directedRank";
 import type { SuccessNotification } from "../notify";
 
 const key = (byte: number) => new PublicKey(new Uint8Array(32).fill(byte));
 const VOTE = key(1);
+// Retired legacy settlement mint — only used to prove the bot refuses it.
 const VSOL = new PublicKey("vSoLxydx6akxyMD9XEcPvGYNGq6Nn66oqVb3UkGkei7");
 const VLP = new PublicKey("EUWoTx5vQQrxaDFdeK2PLUVbnmRWjw4x6sBbmcxBaHjF");
 const TOKEN_PROGRAM = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const INVOICER_PROGRAM = new PublicKey(require("../IDL/vaultInvoicer.json").address);
 const WEBHOOK = "https://discord.invalid/api/webhooks/offline-test";
-const ORACLES = new Set([
-  "Fu9BYC6tWBo1KMKaP3CFoKfRhqv9akmy3DuYwnCyWiyC",
-  "9nyw5jxhzuSs88HxKJyDCsWBZMhxj2uNXsFcyHF5KBAb",
-]);
+const UNSTAKER_IDL = require("../IDL/liquidUnstaker.json");
+const UNSTAKER_PROGRAM = new PublicKey(UNSTAKER_IDL.address);
+const UNSTAKER_POOL = new PublicKey("9nyw5jxhzuSs88HxKJyDCsWBZMhxj2uNXsFcyHF5KBAb");
+const [INVENTORY_SUMMARY] = PublicKey.findProgramAddressSync(
+  [Buffer.from("inventory_summary"), UNSTAKER_POOL.toBuffer()], UNSTAKER_PROGRAM);
+const [UNSTAKER_LP_MINT] = PublicKey.findProgramAddressSync(
+  [Buffer.from("lp_mint"), UNSTAKER_POOL.toBuffer()], UNSTAKER_PROGRAM);
+// The VLP price inputs: the unstake pool and its inventory summary.
+const ORACLES = new Set([UNSTAKER_POOL.toBase58(), INVENTORY_SUMMARY.toBase58()]);
+
+// Price fixture: 40 SOL vault + 10 SOL deactivating + 50 SOL LST inventory
+// over 100 VLP = exactly 1 SOL/VLP. Ignoring the inventory (the pre-e06a485
+// bug) would price VLP at 0.5 and under-fund every top-up.
+const PRICE = { solVaultLamports: 40e9, totalDeactivatingStake: 10e9, totalValueSnapshot: 50e9, totalLpTokens: 100e9 };
+
+// Real Anchor-encoded liquid-unstaker accounts: every IDL field zeroed, then
+// the price inputs above set, so the bot's own fetch + decode path runs.
+function unstakerAccount(name: "pool" | "inventorySummary", values: Record<string, number>) {
+  const program = new Program(UNSTAKER_IDL, { connection: {} } as any);
+  const typeDef: any = program.idl.types!.find((type) => type.name === name);
+  const zero = (type: any): unknown => {
+    if (type === "pubkey") return PublicKey.default;
+    if (type === "bool") return false;
+    if (type === "u64" || type === "i64") return new BN(0);
+    if (typeof type === "string") return 0;
+    if (type.option) return null;
+    if (type.array) return Array.from({ length: type.array[1] }, () => zero(type.array[0]));
+    throw new Error(`unsupported IDL type ${JSON.stringify(type)}`);
+  };
+  const fields = Object.fromEntries(typeDef.type.fields.map((field: any) => [field.name, zero(field.type)]));
+  for (const [field, value] of Object.entries(values)) {
+    if (field in fields) fields[field] = new BN(value.toString());
+  }
+  // Same bytes as the (async) BorshAccountsCoder.encode, built synchronously
+  // so the fixture can stay synchronous: discriminator + borsh layout.
+  const { discriminator, layout } = (program.coder.accounts as any).accountLayouts.get(name);
+  const body = Buffer.alloc(1000);
+  const length = layout.encode(fields, body);
+  return account(Buffer.concat([Buffer.from(discriminator), body.subarray(0, length)]), UNSTAKER_PROGRAM);
+}
 
 function account(data: Buffer, owner = INVOICER_PROGRAM): AccountInfo<Buffer> {
   return { data, owner, executable: false, lamports: 1, rentEpoch: 0 };
@@ -48,8 +86,12 @@ function fixture(t: TestContext, options: {
   listOnly?: string;
   threshold?: string;
   dotenvEnv?: Record<string, string>;
-  tokenBalances?: { vSOL?: bigint; VLP?: bigint };
+  tokenBalances?: { VLP?: bigint };
   solLamports?: number;
+  // Make the VLP price available (pool + inventory summary accounts).
+  price?: boolean;
+  // Settlement mint of the first trusted invoicer (default VLP).
+  firstInvoicerMint?: PublicKey;
 } = {}) {
   const payer = Keypair.generate();
   const env: Record<string, string | undefined> = {
@@ -105,9 +147,13 @@ function fixture(t: TestContext, options: {
 
   const accounts = new Map<string, AccountInfo<Buffer>>();
   const invoicers = [
-    { address: key(2), mint: VSOL, reserves: key(4) },
+    { address: key(2), mint: options.firstInvoicerMint ?? VLP, reserves: key(4) },
     { address: key(3), mint: VLP, reserves: key(5) },
   ];
+  if (options.price) {
+    accounts.set(UNSTAKER_POOL.toBase58(), unstakerAccount("pool", PRICE));
+    accounts.set(INVENTORY_SUMMARY.toBase58(), unstakerAccount("inventorySummary", PRICE));
+  }
   for (const invoicer of invoicers) {
     const bytes = Buffer.alloc(304);
     invoicer.reserves.toBuffer().copy(bytes, 48);
@@ -143,21 +189,26 @@ function fixture(t: TestContext, options: {
     ] });
     return invoices.map(({ pubkey, account }) => ({ pubkey, account }));
   });
-  const getAccount = t.mock.method(Connection.prototype, "getAccountInfo", async (address) => {
+  const lookup = (address: PublicKey) => {
     const found = accounts.get(address.toBase58());
     if (found) return found;
-    // Prices are intentionally unavailable: existing token balances suffice.
+    // Unless `price` is set, the VLP price is unavailable: existing token
+    // balances suffice.
     if (ORACLES.has(address.toBase58())) return null;
     return blocked(`getAccountInfo(${address.toBase58()})`);
-  });
+  };
+  const getAccount = t.mock.method(Connection.prototype, "getAccountInfo", async (address) => lookup(address));
+  // Anchor's account fetch (the VLP price read) goes through the
+  // context-returning variant.
+  const getAccountCtx = t.mock.method(Connection.prototype, "getAccountInfoAndContext", async (address: PublicKey) =>
+    ({ context: { slot: 1 }, value: lookup(address) }));
   const tokenBalances = new Map([
-    [VSOL.toBase58(), options.tokenBalances?.vSOL ?? 100_000_000_000n],
     [VLP.toBase58(), options.tokenBalances?.VLP ?? 100_000_000_000n],
   ]);
   const balances = t.mock.method(Connection.prototype, "getTokenAccountsByOwner", async (owner, filter, commitment) => {
     assert.ok(owner.equals(options.listOnly ? PublicKey.default : payer.publicKey));
     assert.equal(commitment, "confirmed");
-    assert.ok("mint" in filter && (filter.mint.equals(VSOL) || filter.mint.equals(VLP)));
+    assert.ok("mint" in filter && filter.mint.equals(VLP));
     const data = Buffer.alloc(165);
     filter.mint.toBuffer().copy(data);
     owner.toBuffer().copy(data, 32);
@@ -197,7 +248,7 @@ function fixture(t: TestContext, options: {
   };
   return {
     load, payer, config, fetch, log, warn, accounts, invoices, invoicers,
-    epoch, scan, getAccount, balances, tokenBalances, solBalance, send, success, failure, alert, rank, events,
+    epoch, scan, getAccount, getAccountCtx, balances, tokenBalances, solBalance, send, success, failure, alert, rank, events,
     TransactionPendingError: transaction.TransactionPendingError as typeof import("../transaction").TransactionPendingError,
   };
 }
@@ -282,7 +333,7 @@ for (const listOnly of ["1", "true"]) {
     const partialSign = t.mock.method(Transaction.prototype, "partialSign", () => { throw new Error("must not sign"); });
     await f.load().run();
     assert.equal(f.scan.mock.callCount(), 1);
-    assert.equal(f.balances.mock.callCount(), 2);
+    assert.equal(f.balances.mock.callCount(), 1);
     assert.ok(f.log.mock.calls.some(({ arguments: args }) =>
       args[0] === "LIST_ONLY — instruction building verified, nothing sent."));
     for (const mock of [parseKey, sign, legacySign, partialSign, f.send, f.success, f.failure, f.alert, f.rank, f.fetch]) {
@@ -352,7 +403,7 @@ function expectedSuccess(f: ReturnType<typeof fixture>, index: number): SuccessN
   const invoices = f.invoices.slice(index * 8, index * 8 + 8);
   const amounts = new Map<string, bigint>();
   for (const invoice of invoices) {
-    const symbol = invoice.invoicer.mint.equals(VSOL) ? "vSOL" : "VLP";
+    const symbol = "VLP";
     amounts.set(symbol, (amounts.get(symbol) ?? 0n) + invoice.amount);
   }
   return {
@@ -363,7 +414,7 @@ function expectedSuccess(f: ReturnType<typeof fixture>, index: number): SuccessN
   };
 }
 
-test("nine mixed-mint invoices build real pay instructions and notify each confirmed chunk in order", sequential, async (t) => {
+test("nine invoices across both VLP invoicers build real pay instructions and notify each confirmed chunk in order", sequential, async (t) => {
   const f = fixture(t, { count: 9 });
   await f.load().run();
   assert.equal(f.send.mock.callCount(), 2);
@@ -378,7 +429,7 @@ test("nine mixed-mint invoices build real pay instructions and notify each confi
   ]);
   assert.equal(f.failure.mock.callCount(), 0);
   assert.equal(f.rank.mock.callCount(), 1);
-  assert.equal(f.balances.mock.callCount(), 2, "existing balances avoid funding");
+  assert.equal(f.balances.mock.callCount(), 1, "existing balances avoid funding");
   for (const invoicer of f.invoicers) {
     assert.equal(f.getAccount.mock.calls.filter(({ arguments: args }) => args[0].equals(invoicer.address)).length, 1);
   }
@@ -430,58 +481,59 @@ for (const pending of [false, true]) {
 function fundingFixture(t: TestContext, options: { count?: number; solLamports?: number } = {}) {
   const f = fixture(t, {
     count: options.count ?? 1,
-    tokenBalances: { vSOL: 0n },
+    tokenBalances: { VLP: 0n },
     solLamports: options.solLamports ?? 10_000_000_000,
+    price: true,
   });
-  // Only the external purchase builders are synthetic. Invoice discovery,
-  // funding decisions, confirmed balance reads, and pay encoding stay real.
-  const stakePool = mockableModule(t, "@solana/spl-stake-pool");
-  const price = t.mock.method(stakePool, "stakePoolInfo", async () => ({
-    totalLamports: "100000000000", poolTokenSupply: "100000000000",
-  }));
+  // Only the ATA lookup is synthetic. The VLP price read (pool + inventory
+  // summary), the deposit_sol instruction, funding decisions, confirmed
+  // balance reads, and pay encoding stay real.
   const tokenUtils = mockableModule(t, "@saberhq/token-utils");
-  const ata = getATAAddressSync({ mint: VSOL, owner: f.payer.publicKey });
+  const ata = key(71);
   const createATA = t.mock.method(tokenUtils, "getOrCreateATA", async () => ({ address: ata }));
-  const fundingSigner = Keypair.generate();
-  const fundingInstruction = SystemProgram.transfer({
-    fromPubkey: f.payer.publicKey,
-    toPubkey: key(70),
-    lamports: 1,
-  });
-  const deposit = t.mock.method(stakePool, "depositSol", async () => ({
-    instructions: [fundingInstruction], signers: [fundingSigner],
-  }));
-  return { ...f, price, createATA, deposit, ata, fundingSigner, fundingInstruction };
+  return { ...f, createATA, ata };
 }
 
+// SOL the bot must spend: deficit (whole due amount; the wallet holds no VLP)
+// x 1 SOL/VLP (pool + deactivating + inventory) x 1.3 margin.
+const expectedFundingLamports = (f: ReturnType<typeof fundingFixture>) =>
+  Math.ceil(
+    (Number(f.invoices.reduce((sum, invoice) => sum + invoice.amount, 0n)) / 10 ** 9) * 1 * 1.3 * 10 ** 9,
+  );
+
 function assertFundingConstruction(f: ReturnType<typeof fundingFixture>) {
-  assert.equal(f.price.mock.callCount(), 1);
-  const botConnection = f.price.mock.calls[0].arguments[0];
-  assert.equal(botConnection.rpcEndpoint, "http://127.0.0.1:1");
-  assert.equal(f.price.mock.calls[0].arguments[1].toBase58(), [...ORACLES][0]);
+  for (const oracle of [UNSTAKER_POOL, INVENTORY_SUMMARY]) {
+    assert.ok(f.getAccountCtx.mock.calls.some(({ arguments: args }) => args[0].equals(oracle)),
+      `price read ${oracle.toBase58()}`);
+  }
   assert.equal(f.createATA.mock.callCount(), 1);
   const ataOptions = f.createATA.mock.calls[0].arguments[0];
-  assert.ok(ataOptions.mint.equals(VSOL));
+  assert.ok(ataOptions.mint.equals(UNSTAKER_LP_MINT));
   assert.ok(ataOptions.owner.equals(f.payer.publicKey));
-  assert.equal(f.deposit.mock.callCount(), 1);
-  const [connection, pool, owner, lamports, destination] = f.deposit.mock.calls[0].arguments;
-  assert.equal(connection, botConnection);
-  assert.equal(pool.toBase58(), [...ORACLES][0]);
-  assert.ok(owner.equals(f.payer.publicKey));
-  assert.equal(lamports, Math.ceil(Number(f.invoices[0].amount) / 10 ** 9 * 10 ** 9));
-  assert.ok(destination.equals(f.ata));
 }
 
 function assertFundingSend(f: ReturnType<typeof fundingFixture>) {
   const args = f.send.mock.calls[0].arguments;
-  assert.equal(args[0], f.price.mock.calls[0].arguments[0]);
-  assert.deepEqual(args[1], [f.fundingInstruction]);
-  assert.deepEqual(args[2], [f.fundingSigner]);
+  assert.equal(args[0].rpcEndpoint, "http://127.0.0.1:1");
+  const instructions = args[1] as TransactionInstruction[];
+  assert.equal(instructions.length, 1);
+  const [deposit] = instructions;
+  assert.ok(deposit.programId.equals(UNSTAKER_PROGRAM));
+  assert.equal(deposit.data.readBigUInt64LE(8), BigInt(expectedFundingLamports(f)),
+    "funding is priced with the LST inventory included");
+  assert.ok(deposit.keys[0].pubkey.equals(UNSTAKER_POOL));
+  assert.ok(deposit.keys[3].pubkey.equals(f.payer.publicKey));
+  assert.ok(deposit.keys[4].pubkey.equals(f.ata));
+  assert.ok(deposit.keys[5].pubkey.equals(INVENTORY_SUMMARY));
+  assert.deepEqual(args[2], []);
   assert.ok(args[3].publicKey.equals(f.payer.publicKey));
   assert.deepEqual(args[4], []);
   assert.equal(args[5], 0);
   assert.equal(typeof args[6].preRebroadcast, "function");
 }
+
+const isFunding = (instructions: TransactionInstruction[]) =>
+  instructions.some((instruction) => instruction.programId.equals(UNSTAKER_PROGRAM));
 
 function assertDeferredFailure(
   f: ReturnType<typeof fixture>,
@@ -499,13 +551,27 @@ function assertDeferredFailure(
   assert.equal(f.fetch.mock.callCount(), 0);
 }
 
+test("VLP price includes the LST inventory snapshot", sequential, async (t) => {
+  const f = fixture(t, { price: true });
+  assert.equal(await f.load().getVLPPriceSol(), 1);
+});
+
+test("a trusted invoicer settling in a non-VLP mint (legacy vSOL) is refused loudly", sequential, async (t) => {
+  const f = fixture(t, { count: 2, firstInvoicerMint: VSOL });
+  await assert.rejects(f.load().run(), /settles in vSoLxydx.*not the VLP mint.*refusing to pay/);
+  assert.equal(f.send.mock.callCount(), 0);
+  assert.equal(f.success.mock.callCount(), 0);
+  assert.equal(f.failure.mock.callCount(), 1);
+  assert.equal(f.rank.mock.callCount(), 1);
+});
+
 test("an unfunded wallet with no SOL sends nothing and rejects with a non-pending failure", sequential, async (t) => {
   const f = fundingFixture(t, { solLamports: 0 });
   let rejected: unknown;
   await assert.rejects(f.load().run(), (error: unknown) => {
     rejected = error;
     assert.ok(error instanceof Error);
-    assert.equal(error.message, "1 invoice(s) remain unpaid. vSOL: Insufficient SOL for token funding and fees");
+    assert.equal(error.message, "1 invoice(s) remain unpaid. VLP: Insufficient SOL for token funding and fees");
     return true;
   });
   assertFundingConstruction(f);
@@ -528,7 +594,7 @@ for (const pending of [false, true]) {
       f.events.push("funding-send");
       // The reread sees a small balance change, but it still cannot cover the
       // invoice. A pending purchase must not be mistaken for a paid invoice.
-      f.tokenBalances.set(VSOL.toBase58(), 1n);
+      f.tokenBalances.set(VLP.toBase58(), 1n);
       throw fundingError;
     });
     let rejected: unknown;
@@ -537,8 +603,8 @@ for (const pending of [false, true]) {
       assert.ok(error instanceof Error);
       assert.notEqual(error, fundingError, "the rejection describes deferred invoices");
       assert.equal(error.message, pending
-        ? `1 invoice(s) deferred; funding outcome is uncertain. vSOL: ${fundingError.message}`
-        : `1 invoice(s) remain unpaid. vSOL: ${fundingError.message}`);
+        ? `1 invoice(s) deferred; funding outcome is uncertain. VLP: ${fundingError.message}`
+        : `1 invoice(s) remain unpaid. VLP: ${fundingError.message}`);
       if (pending) {
         assert.ok(error instanceof f.TransactionPendingError);
         assert.equal(error.signature, "pending-funding-signature");
@@ -557,60 +623,74 @@ for (const pending of [false, true]) {
 }
 
 for (const stage of ["construction", "send"] as const) {
-  test(`covered VLP invoices are paid before a deferred vSOL funding ${stage} failure is reported`, sequential, async (t) => {
+  test(`a VLP funding ${stage} failure pays nothing and reports the deferred invoices`, sequential, async (t) => {
     const f = fundingFixture(t, { count: 2 });
-    const fundingError = new Error(`offline vSOL funding ${stage} failed`);
+    const fundingError = new Error(`offline VLP funding ${stage} failed`);
     if (stage === "construction") {
-      f.deposit.mock.mockImplementation(async () => { throw fundingError; });
+      f.createATA.mock.mockImplementation(async () => { throw fundingError; });
     }
     f.send.mock.mockImplementation(async (_connection, instructions: TransactionInstruction[]) => {
-      if (instructions.includes(f.fundingInstruction)) {
-        f.events.push("funding-send");
-        throw fundingError;
-      }
-      f.events.push("pay-covered-VLP");
-      return "covered-vlp-signature";
+      assert.ok(isFunding(instructions), "no pay transaction may be sent");
+      f.events.push("funding-send");
+      throw fundingError;
     });
     let rejected: unknown;
     await assert.rejects(f.load().run(), (error: unknown) => {
       rejected = error;
       assert.ok(error instanceof Error);
-      assert.equal(error.message, `1 invoice(s) remain unpaid. vSOL: ${fundingError.message}`);
+      assert.equal(error.message, `2 invoice(s) remain unpaid. VLP: ${fundingError.message}`);
       return true;
     });
     assertFundingConstruction(f);
     const fundingSent = stage === "send";
     if (fundingSent) assertFundingSend(f);
     assert.equal(f.solBalance.mock.callCount(), fundingSent ? 1 : 0);
-    assert.equal(f.balances.mock.callCount(), fundingSent ? 4 : 2);
-    assert.equal(f.send.mock.callCount(), fundingSent ? 2 : 1);
-    // This is still a real Anchor-encoded pay instruction, and the vSOL
-    // invoice must not appear in it or in the success notification.
-    assertChunk(f, fundingSent ? 1 : 0, [f.invoices[1]]);
-    assert.deepEqual(f.success.mock.calls.map(({ arguments: args }) => args), [[WEBHOOK, {
-      invoiceCount: 1,
-      amounts: [{ symbol: "VLP", lamports: f.invoices[1].amount }],
-      epochs: [f.invoices[1].epoch],
-      txHash: "covered-vlp-signature",
-    }]]);
+    assert.equal(f.balances.mock.callCount(), fundingSent ? 2 : 1);
+    assert.equal(f.send.mock.callCount(), fundingSent ? 1 : 0);
+    assert.equal(f.success.mock.callCount(), 0);
     assertDeferredFailure(f, rejected, false);
-    assert.deepEqual(f.events, [
-      ...(fundingSent ? ["funding-send"] : []),
-      "pay-covered-VLP", "success:covered-vlp-signature", "failure", "rank",
-    ]);
+    assert.deepEqual(f.events, [...(fundingSent ? ["funding-send"] : []), "failure", "rank"]);
   });
 }
+
+test("funding that covers the due amount pays every invoice in the same run", sequential, async (t) => {
+  const f = fundingFixture(t, { count: 2 });
+  f.send.mock.mockImplementation(async (_connection, instructions: TransactionInstruction[]) => {
+    if (isFunding(instructions)) {
+      f.events.push("funding-send");
+      // deposit_sol at 1 SOL/VLP with a 1.3x margin covers the deficit.
+      f.tokenBalances.set(VLP.toBase58(), BigInt(expectedFundingLamports(f)));
+      return "funding-signature";
+    }
+    f.events.push("pay-after-funding");
+    return "paid-vlp-signature";
+  });
+  await assert.doesNotReject(f.load().run());
+  assertFundingConstruction(f);
+  assertFundingSend(f);
+  assert.equal(f.balances.mock.callCount(), 2);
+  assert.equal(f.send.mock.callCount(), 2);
+  assertChunk(f, 1, f.invoices);
+  assert.deepEqual(f.success.mock.calls.map(({ arguments: args }) => args), [[WEBHOOK, {
+    invoiceCount: 2,
+    amounts: [{ symbol: "VLP", lamports: f.invoices[0].amount + f.invoices[1].amount }],
+    epochs: f.invoices.map(({ epoch }) => epoch),
+    txHash: "paid-vlp-signature",
+  }]]);
+  assert.equal(f.failure.mock.callCount(), 0);
+  assert.deepEqual(f.events, ["funding-send", "pay-after-funding", "success:paid-vlp-signature", "rank"]);
+});
 
 test("a pending funding outcome does not reject when the confirmed balance now covers every invoice", sequential, async (t) => {
   const f = fundingFixture(t);
   f.send.mock.mockImplementation(async (_connection, instructions: TransactionInstruction[]) => {
-    if (instructions.includes(f.fundingInstruction)) {
+    if (isFunding(instructions)) {
       f.events.push("funding-send");
-      f.tokenBalances.set(VSOL.toBase58(), f.invoices[0].amount);
+      f.tokenBalances.set(VLP.toBase58(), f.invoices[0].amount);
       throw new f.TransactionPendingError("late-funding-signature", "confirmation timed out");
     }
     f.events.push("pay-after-funding");
-    return "paid-vsol-signature";
+    return "paid-vlp-signature";
   });
   await assert.doesNotReject(f.load().run());
   assertFundingConstruction(f);
@@ -620,11 +700,11 @@ test("a pending funding outcome does not reject when the confirmed balance now c
   assertChunk(f, 1, [f.invoices[0]]);
   assert.deepEqual(f.success.mock.calls.map(({ arguments: args }) => args), [[WEBHOOK, {
     invoiceCount: 1,
-    amounts: [{ symbol: "vSOL", lamports: f.invoices[0].amount }],
+    amounts: [{ symbol: "VLP", lamports: f.invoices[0].amount }],
     epochs: [f.invoices[0].epoch],
-    txHash: "paid-vsol-signature",
+    txHash: "paid-vlp-signature",
   }]]);
   assert.equal(f.failure.mock.callCount(), 0);
   assert.equal(f.rank.mock.callCount(), 1);
-  assert.deepEqual(f.events, ["funding-send", "pay-after-funding", "success:paid-vsol-signature", "rank"]);
+  assert.deepEqual(f.events, ["funding-send", "pay-after-funding", "success:paid-vlp-signature", "rank"]);
 });
